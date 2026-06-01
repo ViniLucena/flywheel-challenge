@@ -1,2 +1,3 @@
 # Graded runtime deps only. The SDK itself uses the Python standard library.
 # Add your agent runtime deps below.
+rank-bm25==0.2.2
