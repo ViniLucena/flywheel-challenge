@@ -22,5 +22,5 @@ while True:
         print(f"Detalhes: {data}")
         break
     else:
-        print(f"⏳ O agente ainda está rodando as tarefas... (Status atual: {status})")
-        time.sleep(60)
+        print(f"O agente ainda está rodando as tarefas... (Status atual: {status})")
+        time.sleep(10)

@@ -162,31 +162,23 @@ def solve(ctx):
 
 === LIMITES ===
 - Você tem no máximo {ctx.max_steps} passos.
+- **PROIBIÇÃO ABSOLUTA:** Se a tarefa mencionar apenas "Venmo" (ou "Venmo payments"), NÃO execute ações em Splitwise, Todoist, Gmail, Simple Note, Spotify ou qualquer outro app. Ignore completamente os tokens desses apps que estejam na memória.
 - Prefira run_code a múltiplas call_api para economizar passos.
 - Nunca invente parâmetros ou nomes de campos.
+- **Tarefas de ação pura:** Se a instrução não pedir explicitamente uma resposta textual (ex: "send", "go to", "keep going", "pay", "text"), chame `complete_task` com `""` (string vazia). Não invente respostas descritivas.
 - **PROIBIDO: NÃO use Gmail, Todoist, Simple Note, File System ou qualquer outro app não mencionado na tarefa.** Mesmo que a memória contenha tokens para eles, ignore-os completamente. Se a tarefa fala apenas de Spotify, apenas APIs do Spotify são permitidas.
 - **Verificação de identidade:** No início da tarefa, chame supervisor.show_profile(). Se o email retornado for diferente do email associado ao token salvo (ex: token_spotify foi gerado para outro usuário), ignore o token e faça um novo login.
 - **Dentro de run_code, use APENAS a sintaxe `apis.<app>.<api>(...)`. NUNCA use `apis.call_api()` (ela não funciona).**
 - APÓS IMPRIMIR A RESPOSTA FINAL no run_code, NÃO execute mais nenhum comando. No passo seguinte, chame complete_task com a resposta. Se você já tem a resposta e ainda há passos restantes, ignore-os e finalize.
-- **Tarefas de ação pura:** Se a instrução não pedir explicitamente uma resposta textual (ex: "send", "go to", "keep going", "pay", "text"), chame `complete_task` com `""` (string vazia). Não invente respostas descritivas.
+- **Datas dinâmicas:** Se a tarefa mencionar "last N days", "this week", "today", etc., use `datetime.datetime.now()` e `datetime.timedelta` no código. NUNCA use datas fixas.
 
-=== EXEMPLO PARA FONTES DE DADOS DO SPOTIFY ===
-- "song library" → use show_song_library. Cada item tem campo 'song_id'.
-- "album library" → use show_album_library. Cada item tem campo 'song_ids' (lista de IDs).
-- "playlist library" → use show_playlist_library. Cada item tem campo 'song_ids' (lista de IDs).
-- "liked songs" → use show_liked_songs (apenas se a tarefa mencionar "liked" ou "curtidas").
-- Para tarefas que pedem "top N most played" de um gênero específico:
-   1. Colete todos os song_ids das três primeiras fontes (SEM liked, a menos que pedido).
-   2. Para cada ID, chame show_song para obter genre e play_count.
-   3. Filtre pelo gênero exato (case-insensitive).
-   4. Ordene por play_count decrescente e pegue os N primeiros.
-   5. Retorne os títulos em CSV e chame complete_task IMEDIATAMENTE.
-- Para tarefas de contagem ("How many unique songs"):
-   1. Colete os song_ids das três primeiras fontes (song_library, album_library, playlist_library).
-   2. Conte os IDs únicos.
-   3. Responda APENAS com o número (ex: "81").
-- **Para tarefas que pedem uma lista ou número (ex: "top N", "how many", "list of"):** retorne a resposta e chame `complete_task` com ela.
-- **Para tarefas que são apenas ações (ex: "send", "keep going", "pay"):** execute as ações e chame `complete_task` com `""`.
+=== DESCOBRINDO A ESTRUTURA DE APIS DESCONHECIDAS ===
+- Use search_apis para encontrar endpoints de listagem (ex: `<app> show`, `<app> list`, `<app> library`).
+- Leia api_doc para conhecer os parâmetros e a resposta.
+- No primeiro resultado de uma listagem, imprima as chaves: print(list(resultado[0].keys())).
+- Se houver uma chave que termina em "_ids" (ex: song_ids, transaction_ids, item_ids), use-a diretamente para obter IDs aninhados.
+- Para atributos que não estão no resumo (ex: gênero, play_count), chame a API de detalhes (ex: show_song, show_transaction, get_details).
+- Paginação universal: page_index = 0,1,... até lista vazia.
 
 === CONHECIMENTO INICIAL (RAG) ===
 {context_docs}
@@ -259,7 +251,7 @@ def solve(ctx):
         if t_name == "complete_task":
           instruction_lower = ctx.instruction.lower()
           question_words = ["how many", "list", "what", "which", "give me", "tell me", "show me"]
-          action_verbs = ["send", "pay", "move", "go", "keep going", "reach", "create", "delete"]
+          action_verbs = ["send", "pay", "move", "go", "keep going", "reach", "create", "delete", "follow", "like", "comment", "post", "add", "remove", "curtir", "comentar"]
           
           is_action = False
           # se nao tem palavra de pergunta explícita E tem verbo de acao forte
