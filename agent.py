@@ -170,7 +170,7 @@ def solve(ctx):
 - APÓS IMPRIMIR A RESPOSTA FINAL no run_code, NÃO execute mais nenhum comando. No passo seguinte, chame complete_task com a resposta. Se você já tem a resposta e ainda há passos restantes, ignore-os e finalize.
 - **Tarefas de ação pura:** Se a instrução não pedir explicitamente uma resposta textual (ex: "send", "go to", "keep going", "pay", "text"), chame `complete_task` com `""` (string vazia). Não invente respostas descritivas.
 
-=== FONTES DE DADOS DO SPOTIFY ===
+=== EXEMPLO PARA FONTES DE DADOS DO SPOTIFY ===
 - "song library" → use show_song_library. Cada item tem campo 'song_id'.
 - "album library" → use show_album_library. Cada item tem campo 'song_ids' (lista de IDs).
 - "playlist library" → use show_playlist_library. Cada item tem campo 'song_ids' (lista de IDs).
