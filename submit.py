@@ -46,14 +46,16 @@ a estrutura força answer="" independentemente do que o modelo gerou, evitado fa
   5. Encerramento ao chamar complete_task.
 - Fallback de segurança: se o self_loop termina sem complete_task, a harness chama o encerramento com answer="".
 - Resultado prático local: 9/10 acertos (TGC). A única falha foi por limite de passos, não por erro lógico estrutural.""",
-    "systems": """Agente ReAct com self_loop principal em Python. 
-    Orquestra 5 tools (ferramentas MCP) via ctx.model e ctx.mcp.call. 
-    RAG offline com BM25 indexando 457 documentações. 
-    Memory persistente usando ctx.memory.write/read, com filtro por app 
-    (só injeta tokens relevantes à tarefa no prompt). 
-    Introspecção de esquemas via print(keys()). 
-    Fallback para answer="" em tarefas de ação pura. 
-    Limite de passos respeitado e complete_task forçado ao final."""
+    "systems": """Sistema implementado em Python. Loop ReAct principal no `solve(ctx)`. 
+    5 ferramentas MCP definidas via `MCP_TOOLS` (JSON schema). 
+    RAG offline: `API_Retriever` com BM25 indexa 457 documentações; 
+    `search()` retorna string truncada injetada no prompt. 
+    Memória: `ctx.memory.read/write` com filtro dinâmico: `keywords_to_apps` 
+    analisa instrução e só passa tokens dos apps necessários. 
+    Introspecção de esquemas: em caso de KeyError, o modelo imprime `.keys()` e corrige. 
+    Interceptação de ações: no `complete_task`, detecta verbos de ação e força `answer=""`. 
+    Fallback de segurança ao final do loop. 
+    Testado localmente com `run_local.py --n 10` obtendo 90%' de acerto."""
 }
 
 print("Enviando submissão...")
