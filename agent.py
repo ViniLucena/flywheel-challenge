@@ -76,6 +76,11 @@ MCP_TOOLS = [
 ]
 
 def solve(ctx):
+  import os
+  override = os.getenv("APPWORLD_TASK_OVERRIDE")
+  if override:
+    ctx.instruction = override
+    print(f"[OVERRIDE] Tarefa forçada: {override}")
   instruction = ctx.instruction
   print(f"\n[NOVA TAREFA] {instruction}\n")
 
@@ -87,31 +92,108 @@ def solve(ctx):
   if not isinstance(memoria_sessao, dict):
     memoria_sessao = {}
 
-  print(f"\n[DIAGNOSTICO] Memória carregada do disco: {memoria_sessao}\n")
+  #print(f"\n[DIAGNOSTICO ANTES DO FILTRO] memoria total no disco: {memoria_sessao.keys()}\n")
 
-  # PROMPT DO SISTEMA:
-  system_prompt = f"""Você é um Engenheiro de Software Autônomo operando no AppWorld.
-    Sua tarefa: {instruction}
+  instruction_lower = instruction.lower()
+  
+  # dict de mapeamento de intencao para o respectivo app
+  keywords_to_apps = {
+      "spotify": ["spotify", "song", "album", "playlist", "music", "track"],
+      "venmo": ["venmo", "pay", "paid", "owed money", "send money", "transaction"],
+      "phone": ["phone", "text", "message", "contact", "sms"],
+      "gmail": ["gmail", "email", "inbox", "thread"],
+      "todoist": ["todoist", "task", "project", "todo"],
+      "file_system": ["file", "directory", "folder", "system"],
+      "simple_note": ["note", "simple_note"],
+      "splitwise": ["splitwise", "expense", "owe", "balance", "group"],
+      "amazon": ["amazon", "order", "buy", "product", "cart"]
+  }
+  
+  apps_necessarios = set()
+  for app, keywords in keywords_to_apps.items():
+      if any(kw in instruction_lower for kw in keywords):
+          apps_necessarios.add(app)
+          
+  memoria_filtrada = {}
+  for chave, valor in memoria_sessao.items():
+      # se for token de autenticação, passa se o app for necessário
+      if chave.startswith("auth_"):
+          app_name = chave.replace("auth_", "")
+          if app_name in apps_necessarios:
+              memoria_filtrada[chave] = valor
+      else:
+          # mantem na memoria aprendizados gerais ou regras que nao sao tokens
+          memoria_filtrada[chave] = valor
 
-    === REGRAS ===
-    1. Você tem no máximo {ctx.max_steps} passos. NÃO gaste turnos com `search_apis` ou `api_doc` se a informação já estiver no CONHECIMENTO INICIAL abaixo.
-    2. Sempre que possível, escreva um único script em `run_code` para fazer todo o processamento de dados, paginação e filtragem de uma vez só.
-    3. Assim que obtiver o resultado final via print do `run_code`, chame IMEDIATAMENTE a ferramenta `complete_task` informando a resposta. Não faça checagens repetitivas.
+  #print(f"[DIAGNOSTICO DEPOIS DO FILTRO] apps deduzidos: {apps_necessarios}")
+  #print(f"[DIAGNOSTICO DEPOIS DO FILTRO] memoria injetada: {memoria_filtrada.keys()}\n")
 
-    === REGRAS ESTRITAS ===
-    1. PAGINAÇÃO: Se uma API retornar uma lista, SEMPRE use o `run_code` para fazer paginação (page_index=0, 1...) até vir vazio.
-    2. PREVENÇÃO DE DANO: NUNCA delete ou altere um registro a menos que a instrução peça explicitamente.
-    3. LOGIN E ATALHOS MENTAIS: Verifique a MEMÓRIA DA SESSÃO. 
-       - Se NÃO houver token do app alvo: use `supervisor.show_account_passwords` via `call_api` para descobrir a senha e faça o login.
-       - Se o token JÁ ESTIVER na memória: É EXTREMAMENTE PROIBIDO usar `search_apis` ou `api_doc`. Vá direto para a escrita do script em `run_code`! 
-       - ATALHOS CONHECIDOS (Use via apis.nome_do_app.nome_da_api): Para o Spotify, você já conhece `show_song_library`, `show_album_library`, `show_playlist_library`, `show_song`, `show_genres`.
+  system_prompt = f"""Você é um engenheiro de software no AppWorld. Resolva a tarefa com eficiência.
 
-    === CONHECIMENTO INICIAL (RAG) ===
-    {context_docs}
+=== PROTOCOLO OBRIGATÓRIO ===
 
-    === MEMÓRIA DA SESSÃO (TOKENS SALVOS) ===
-    {json.dumps(memoria_sessao)}
-    """
+1. ENTENDA a tarefa e identifique quais aplicativos são necessários.
+2. Consulte a MEMÓRIA DA SESSÃO (tokens e habilidades salvas) antes de qualquer ação.
+3. Para qualquer app que precise de autenticação:
+   - Se não houver token na memória, chame supervisor.show_profile() e supervisor.show_account_passwords() para obter credenciais reais.
+   - Faça login usando call_api. NUNCA invente credenciais.
+   - Salve o dicionário completo de resposta (access_token, refresh_token, etc.) como auth_{{app}}.
+4. DESCOBERTA DE APIS:
+   - Use search_apis para encontrar endpoints relevantes.
+   - Leia api_doc antes de usar uma API desconhecida.
+5. INTROSPECÇÃO DE ESQUEMAS:
+   - No primeiro resultado de qualquer listagem, execute um pequeno run_code para imprimir as chaves do primeiro item: print(list(resultado[0].keys())).
+   - Use .get('chave', fallback) para acessar campos.
+   - Se um item de resumo contiver uma chave que termina em "_ids" ou "_items", use-a diretamente para obter IDs aninhados (ex: album['song_ids']).
+6. EXECUÇÃO:
+   - Para operações pontuais (login, criar um item, deletar), use call_api.
+   - Para paginação, filtros, agregações ou operações em massa, escreva um único script em run_code.
+   - Todas as APIs de listagem devem ser paginadas: page_index = 0,1,... até resposta vazia.
+7. FINALIZAÇÃO:
+   - Assim que obtiver a resposta exata solicitada (ex: o produto mais barato, a lista de músicas), chame complete_task com a resposta.
+   - NÃO faça passos adicionais (explorar outros termos, adicionar ao carrinho, etc.) a menos que a tarefa peça explicitamente.
+8. RECUPERAÇÃO DE ERROS:
+   - Se run_code falhar com KeyError, trace o erro, inspecione as chaves do objeto (print(objeto.keys())) e corrija o nome do campo.
+   - Retry no máximo uma vez. Se falhar novamente, ajuste o plano e chame complete_task com uma explicação.
+9. MEMÓRIA DE HABILIDADES:
+   - Quando você resolver uma tarefa com sucesso, registre o procedimento (ex: "para buscar livros baratos na Amazon, use search_products com sort_by='+price' e filtre product_type contendo 'book'").
+   - Ao iniciar uma tarefa semelhante, recupere essa habilidade da memória.
+   
+
+=== LIMITES ===
+- Você tem no máximo {ctx.max_steps} passos.
+- Prefira run_code a múltiplas call_api para economizar passos.
+- Nunca invente parâmetros ou nomes de campos.
+- **PROIBIDO: NÃO use Gmail, Todoist, Simple Note, File System ou qualquer outro app não mencionado na tarefa.** Mesmo que a memória contenha tokens para eles, ignore-os completamente. Se a tarefa fala apenas de Spotify, apenas APIs do Spotify são permitidas.
+- **Verificação de identidade:** No início da tarefa, chame supervisor.show_profile(). Se o email retornado for diferente do email associado ao token salvo (ex: token_spotify foi gerado para outro usuário), ignore o token e faça um novo login.
+- **Dentro de run_code, use APENAS a sintaxe `apis.<app>.<api>(...)`. NUNCA use `apis.call_api()` (ela não funciona).**
+- APÓS IMPRIMIR A RESPOSTA FINAL no run_code, NÃO execute mais nenhum comando. No passo seguinte, chame complete_task com a resposta. Se você já tem a resposta e ainda há passos restantes, ignore-os e finalize.
+- **Tarefas de ação pura:** Se a instrução não pedir explicitamente uma resposta textual (ex: "send", "go to", "keep going", "pay", "text"), chame `complete_task` com `""` (string vazia). Não invente respostas descritivas.
+
+=== FONTES DE DADOS DO SPOTIFY ===
+- "song library" → use show_song_library. Cada item tem campo 'song_id'.
+- "album library" → use show_album_library. Cada item tem campo 'song_ids' (lista de IDs).
+- "playlist library" → use show_playlist_library. Cada item tem campo 'song_ids' (lista de IDs).
+- "liked songs" → use show_liked_songs (apenas se a tarefa mencionar "liked" ou "curtidas").
+- Para tarefas que pedem "top N most played" de um gênero específico:
+   1. Colete todos os song_ids das três primeiras fontes (SEM liked, a menos que pedido).
+   2. Para cada ID, chame show_song para obter genre e play_count.
+   3. Filtre pelo gênero exato (case-insensitive).
+   4. Ordene por play_count decrescente e pegue os N primeiros.
+   5. Retorne os títulos em CSV e chame complete_task IMEDIATAMENTE.
+- Para tarefas de contagem ("How many unique songs"):
+   1. Colete os song_ids das três primeiras fontes (song_library, album_library, playlist_library).
+   2. Conte os IDs únicos.
+   3. Responda APENAS com o número (ex: "81").
+- **Para tarefas que pedem uma lista ou número (ex: "top N", "how many", "list of"):** retorne a resposta e chame `complete_task` com ela.
+- **Para tarefas que são apenas ações (ex: "send", "keep going", "pay"):** execute as ações e chame `complete_task` com `""`.
+
+=== CONHECIMENTO INICIAL (RAG) ===
+{context_docs}
+
+=== MEMÓRIA DA SESSÃO ===
+{json.dumps(memoria_filtrada)}
+"""
   
   messages = [
     {"role": "system", "content": system_prompt},
@@ -147,12 +229,12 @@ def solve(ctx):
     
     messages.append(msg_dict)
 
-    if msg_dict.get("content"):
-      print(f"[pensamento]: {msg_dict.get('content')}")
+    #if msg_dict.get("content"):
+      #print(f"[pensamento]: {msg_dict.get('content')}")
 
     tool_calls = msg_dict.get("tool_calls")
     if not tool_calls:
-      print("[aviso]: modelo nao chamou ferramenta, forçando continuacao...")
+      #print("[aviso]: modelo nao chamou ferramenta, forçando continuacao...")
       messages.append({"role":"user", "content":"você nao executou nenhuma acao. Use uma ferramenta ou chame complete_task"})
       continue
     
@@ -169,46 +251,31 @@ def solve(ctx):
 
       print(f"executando: {t_name} com {t_args}")
 
-      # chama a ferramenta real no simulator
       try:
         if t_name == "complete_task":
+          instruction_lower = ctx.instruction.lower()
+          question_words = ["how many", "list", "what", "which", "give me", "tell me", "show me"]
+          action_verbs = ["send", "pay", "move", "go", "keep going", "reach", "create", "delete"]
+          
+          is_action = False
+          # se nao tem palavra de pergunta explícita E tem verbo de acao forte
+          if not any(qw in instruction_lower for qw in question_words):
+              if any(av in instruction_lower for av in action_verbs):
+                  is_action = True
+                  
+          if is_action:
+              print("[INTERCEPTAÇÃO] tarefa identificada como AÇÃO pura. Forçando answer=''")
+              if isinstance(t_args, dict):
+                  t_args["answer"] = ""
+              else:
+                  t_args = {"answer": ""}
+          
           resultado = ctx.mcp.call("complete_task", t_args if t_args else {"answer":""})
           encerrou = True
+        
         else:
+          # para todas as outras ferramentas (search_apis, api_doc, call_api, run_code)
           resultado = ctx.mcp.call(t_name, t_args)
-          
-          print("\n[DEBUG]")
-          print(f"API chamada: {t_name}")
-          print(f"tipo do retorno: {type(resultado)}")
-                    
-          # Limita o tamanho do output na tela para não travar o terminal se for um JSON gigante
-          res_str = str(resultado)
-          print(f"Conteúdo: {res_str[:200]} {'...' if len(res_str) > 200 else ''}\n")
-          
-          if t_name == "call_api" and isinstance(resultado, dict):
-            token_val = None
-            
-            # extraindo os dados da chave 'result'
-            dados = resultado.get("result", resultado)
-            
-            # caso a API de login retorne a string direto dentro do 'result'
-            if isinstance(dados, str) and t_args.get("api") == "login":
-              token_val = dados
-              
-            # caso a API retorne um dicionário aninhado
-            elif isinstance(dados, dict):
-              # vasculha as chaves procurando padroes de credenciais
-              for k,v in dados.items():
-                if isinstance(v, str) and ('token'in k.lower() or 'key' in k.lower()):
-                  token_val = v
-                  break
-                
-            # salva
-            if token_val:
-              app_alvo = t_args.get("app", "unknown")
-              print(f"[memoria] token detectado para '{app_alvo}'. Salvando...")
-              
-              ctx.memory.write(f"token_{app_alvo}", token_val)
                 
       except Exception as e:
         resultado = {"error":f"exceção interna: {str(e)}"}
