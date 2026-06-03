@@ -227,6 +227,10 @@ def solve(ctx):
     else:
       msg_dict = msg if isinstance(msg, dict) else dict(msg)
     
+    # se content for vazio ou None, injeta um texto padrão
+    if not msg_dict.get("content"):
+      msg_dict["content"] = "executing tool"
+    
     messages.append(msg_dict)
 
     #if msg_dict.get("content"):
@@ -260,15 +264,15 @@ def solve(ctx):
           is_action = False
           # se nao tem palavra de pergunta explícita E tem verbo de acao forte
           if not any(qw in instruction_lower for qw in question_words):
-              if any(av in instruction_lower for av in action_verbs):
-                  is_action = True
+            if any(av in instruction_lower for av in action_verbs):
+              is_action = True
                   
           if is_action:
-              print("[INTERCEPTAÇÃO] tarefa identificada como AÇÃO pura. Forçando answer=''")
-              if isinstance(t_args, dict):
-                  t_args["answer"] = ""
-              else:
-                  t_args = {"answer": ""}
+            print("[INTERCEPTAÇÃO] tarefa identificada como AÇÃO pura. Forçando answer=''")
+            if isinstance(t_args, dict):
+              t_args["answer"] = ""
+            else:
+              t_args = {"answer": ""}
           
           resultado = ctx.mcp.call("complete_task", t_args if t_args else {"answer":""})
           encerrou = True
@@ -281,10 +285,15 @@ def solve(ctx):
         resultado = {"error":f"exceção interna: {str(e)}"}
 
       # adiciona o resultado da ferramenta ao historico de mensagens
+      conteudo_json = json.dumps(resultado, default=str)
+      # se a serialização ficar vazia, devolve uma confirmação ---
+      if not conteudo_json or conteudo_json == '""' or conteudo_json.isspace():
+        conteudo_json = '"ok"'
+          
       messages.append({
         "role":"tool",
         "tool_call_id": t_id,
-        "content":json.dumps(resultado, default=str)
+        "content":conteudo_json
       })
 
       # erros com a API: se a API reclamar (ex: token faltando), avisa o modelo

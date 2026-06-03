@@ -1,13 +1,13 @@
 import requests
 
+
+
 URL = "https://homodeus-flywheel.fly.dev/api/submit"
 PAYLOAD = {
     "token": "fw_live_5bjrfaga745g6p67jxvx",
     "repo": "https://github.com/ViniLucena/flywheel-challenge.git",
     "writeup": """Agente Autônomo para Flywheel | Vinícius Lucena
 
-O sistema orquestra o modelo fixo gemini-3-flash-preview através de uma arquitetura 
-ReAct com RAG offline, memória persistente filtrada e um self_loop de reflexão. 
 
 1. MCP de verdade
 - Uso estrito das 5 tools (search_apis, api_doc, call_api, run_code, complete_task) via ctx.model 
@@ -21,10 +21,10 @@ corrigindo o nome do campo no próximo passo.
 
 2. Sistema que aprende (Memory Viva)
 - Uso de FLYWHEEL_MEMORY_DIR para salvar tokens de autenticação (ex: auth_spotify) e habilidades.
-- Filtro de memory por app: antes de montar os prompts, o código analisa a instrução 
+- Filtro de memória por app: antes de montar os prompts, o código analisa a instrução 
 com um dicionário keywords_to_apps (ex: "pay" -> venmo, "song" -> spotify). 
 Apenas os tokens dos apps necessários são injetados. Isso evita que tokens de Gmail ou 
-Todoist distraiam o modelo em tarefas Spotify.
+Todoist distraiam o modelo em tarefas Spotify, por exemplo.
 - Exemplo: na primeira tarefa do Spotify, o token é salvo; 
 na segunda, o prompt já contém auth_spotify e o login é pulado.
 
@@ -35,7 +35,7 @@ na segunda, o prompt já contém auth_spotify e o login é pulado.
 "Tarefas de ação pura: answer vazia".
 - Há uma interceptação do código: dentro do complete_task, se a instrução contém verbos 
 de ação pura (send, pay, keep going) e nenhuma palavra de pergunta (how many, list), 
-a estrutura força answer="" independentemente do que o modelo gerou, evitado falhas no oráculo.
+a estrutura força answer="" independentemente do que o modelo gerou.
 
 4. Harness Agêntica e Self_Loop
 - O self_loop principal (for passo in range(ctx.max_steps)) orquestra:
@@ -46,16 +46,14 @@ a estrutura força answer="" independentemente do que o modelo gerou, evitado fa
   5. Encerramento ao chamar complete_task.
 - Fallback de segurança: se o self_loop termina sem complete_task, a harness chama o encerramento com answer="".
 - Resultado prático local: 9/10 acertos (TGC). A única falha foi por limite de passos, não por erro lógico estrutural.""",
-    "systems": """Sistema implementado em Python. Loop ReAct principal no `solve(ctx)`. 
-    5 ferramentas MCP definidas via `MCP_TOOLS` (JSON schema). 
-    RAG offline: `API_Retriever` com BM25 indexa 457 documentações; 
-    `search()` retorna string truncada injetada no prompt. 
-    Memória: `ctx.memory.read/write` com filtro dinâmico: `keywords_to_apps` 
-    analisa instrução e só passa tokens dos apps necessários. 
-    Introspecção de esquemas: em caso de KeyError, o modelo imprime `.keys()` e corrige. 
-    Interceptação de ações: no `complete_task`, detecta verbos de ação e força `answer=""`. 
-    Fallback de segurança ao final do loop. 
-    Testado localmente com `run_local.py --n 10` obtendo 90%' de acerto."""
+    "systems": {
+        "mcp": "Orquestração estrita das 5 ferramentas (search_apis, api_doc, call_api, run_code, complete_task) via ctx.mcp.call. Priorização absoluta do run_code para processar paginações massivas localmente no interpretador Python do container.",
+        "rag": "Implementação totalmente offline via rank_bm25. O sistema indexa as 457 documentações localmente. O retriever tokeniza a query da tarefa e injeta no prompt apenas os manuais relevantes, com trava de 1500 caracteres, resolvendo o discovery sem LLMs auxiliares.",
+        "memory": "Filtro com 'Visão em Túnel'. Para evitar diluição de atenção e alucinação, o agent.py deduz os apps necessários por keywords na instrução (ex: 'pay'-> venmo) e injeta estritamente os tokens de auth úteis. Tokens de outros apps são escondidos do prompt.",
+        "self_loop": "Loop principal que despacha ações e força a reflexão. Se ocorre KeyError, reinjeta o erro e obriga o modelo a rodar print(list(obj.keys())) para introspecção. Se a tarefa é de ação pura (ex: send), intercepta e força answer='', garantindo o bypass de formatações erradas e o PASS no oráculo.",
+        "tools": "Mecanismo de fallback e interceptação programado no nível do código Python, não dependendo puramente da obediência do modelo ao prompt.",
+        "prompts": "O system_prompt atua como protocolo de compilação restritivo: proíbe uso de apps fora do escopo, dita regras de while True para paginação e proíbe alucinação de esquemas."
+    }
 }
 
 print("Enviando submissão...")
