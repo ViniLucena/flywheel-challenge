@@ -1,3 +1,5 @@
+import time
+import random
 import json
 from retriever import API_Retriever
 
@@ -74,6 +76,40 @@ MCP_TOOLS = [
       }
   }
 ]
+
+def call_with_retry(func, *args, max_retries=4, base_delay=2, **kwargs):
+  for attempt in range(max_retries):
+    try:
+      # 1 executa a funcao
+      resultado = func(*args, **kwargs)
+            
+      # 2 verifica se a funcao retornou um dicionario com erro (comportamento do ctx.model)
+      if isinstance(resultado, dict) and "error" in resultado:
+        erro_msg = str(resultado["error"])
+        if "429" in erro_msg or "budget exhausted" in erro_msg.lower() or "too many requests" in erro_msg.lower():
+          # força a ida para o catch levantando a excecao
+          raise Exception(erro_msg)
+        else:
+          # se for um erro de prompt (ex: content vazio), nao eh falha de rede, entao devolve o erro
+          return resultado
+            
+      # se deu tudo certo, retorna o resultado
+      return resultado
+
+    except Exception as e:
+      # 3 detecta 429 ou outros erros transitorios (captura do ctx.mcp.call ou do raise acima)
+      if "429" in str(e) or "budget exhausted" in str(e).lower() or "too many requests" in str(e).lower():
+        if attempt < max_retries - 1: # nao dorme na ultima tentativa falha
+          delay = base_delay * (2 ** attempt) + random.uniform(0, 1.0)
+          print(f"[RETRY] Tentativa {attempt+1}/{max_retries} falhou com 429. Aguardando {delay:.2f}s...")
+          time.sleep(delay)
+          continue
+            
+      # se nao for 429 ou se acabaram as tentativas, explode o erro para o log
+      if attempt == max_retries - 1:
+        return {"error": f"Falha após {max_retries} tentativas. Erro original: {str(e)}"}
+            
+      return {"error": str(e)}
 
 def solve(ctx):
   import os
@@ -200,7 +236,7 @@ def solve(ctx):
 
       
     # chama o modelo usando o metodo do SDK passando o schema das ferramentas
-    resposta = ctx.model(messages,tools=MCP_TOOLS)
+    resposta = call_with_retry(ctx.model, messages, tools=MCP_TOOLS)
 
     if isinstance(resposta, dict) and resposta.get("error"):
       print(f"erro de conexao: {resposta['error']}")
@@ -266,7 +302,7 @@ def solve(ctx):
             else:
               t_args = {"answer": ""}
           
-          resultado = ctx.mcp.call("complete_task", t_args if t_args else {"answer":""})
+          resultado = call_with_retry(ctx.mcp.call, t_name, t_args)
           encerrou = True
         
         else:
