@@ -122,23 +122,24 @@ def solve(ctx):
   instruction = ctx.instruction
   print(f"\n[NOVA TAREFA] {instruction}\n")
 
-   # RAG: busca as ferramentas usando o indice local com query expansion e app boosting
-  context_docs = rag_retriever.search(instruction, boost_relevant_apps=list(apps_necessarios))
-  
   # memoria: carrega o que foi aprendido em tarefas passadas
   memoria_sessao = ctx.memory.read()
   if not isinstance(memoria_sessao, dict):
     memoria_sessao = {}
-
-  #print(f"\n[DIAGNOSTICO ANTES DO FILTRO] memoria total no disco: {memoria_sessao.keys()}\n")
-
+    
   instruction_lower = instruction.lower()
-  
   # Usa o mapeamento expandido do retriever (muito mais completo que hardcoded terms)
   apps_necessarios = set()
   for app, keywords in APP_KEYWORD_MAP.items():
       if any(kw in instruction_lower for kw in keywords):
           apps_necessarios.add(app)
+
+   # RAG: busca as ferramentas usando o indice local com query expansion e app boosting
+  context_docs = rag_retriever.search(instruction, boost_relevant_apps=list(apps_necessarios))
+  
+
+  #print(f"\n[DIAGNOSTICO ANTES DO FILTRO] memoria total no disco: {memoria_sessao.keys()}\n")
+
 
           
   memoria_filtrada = {}
@@ -152,7 +153,7 @@ def solve(ctx):
       # Assume skill keys follow pattern: "skill_<app>_<description>"
       # Or check if the skill content mentions irrelevant apps
       should_keep = any(app in chave.lower() for app in apps_necessarios)
-      if should_keep or not any(app in str(valor).lower() for app in keywords_to_apps.keys()):
+      if should_keep or not any(app in str(valor).lower() for app in APP_KEYWORD_MAP.keys()):
           memoria_filtrada[chave] = valor
 
   #print(f"[DIAGNOSTICO DEPOIS DO FILTRO] apps deduzidos: {apps_necessarios}")
@@ -256,9 +257,11 @@ Example: "Amazon cheap books → search_products(sort_by='+price', filter produc
     elif isinstance(resposta, list):
       print(f"erro da API: {resposta}")
       break
-      
+    elif not isinstance(resposta, dict):
+      print(f"Resposta inesperada do modelo: {type(resposta)} - {resposta}")
+      break
 
-    # extrai a mensagem do modelo
+    # extrai a mensagem do modelo (agora resposta é garantidamente um dict)
     msg = resposta.get("choices", [{}])[0].get("message", {})
 
     # garantindo que a mensagem que volta para o historico eh um dict valido
