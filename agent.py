@@ -168,7 +168,7 @@ def _limpar_memoria(memoria, max_entries=100):
 
     return limpa
 
-def call_with_retry(func, *args, max_retries=4, base_delay=2, **kwargs):
+def call_with_retry(func, *args, max_retries=2, base_delay=2, **kwargs):
   for attempt in range(max_retries):
     try:
       resultado = func(*args, **kwargs)
@@ -396,7 +396,8 @@ SESSION MEMORY (Filtered):
 
       # Limpeza e Escrita
       memoria_limpa = _limpar_memoria(memoria_atual, max_entries=100)
-      ctx.memory.write(memoria_limpa)
+      for chave, valor in memoria_limpa.items():
+        ctx.memory.write(chave, valor)
       print(f"[MEMÓRIA] {len(memoria_limpa)} entries salvas.")
       break
 
@@ -412,4 +413,5 @@ SESSION MEMORY (Filtered):
         memoria_atual[chave] = {"token": token_val, "timestamp": time.time()}
     
     memoria_limpa = _limpar_memoria(memoria_atual, max_entries=100)
-    ctx.memory.write(memoria_limpa)
+    for chave, valor in memoria_limpa.items():
+      ctx.memory.write(chave, valor)
