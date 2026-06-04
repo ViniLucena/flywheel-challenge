@@ -1,12 +1,10 @@
 import time
 import random
 import json
+import hashlib
 from retriever import API_Retriever, APP_KEYWORD_MAP
 
 rag_retriever = API_Retriever()
-
-# definicao dos schemas das 5 ferramentas do appworld
-# orienta o que o gemini pode fazer e quais argumentos enviar
 
 MCP_TOOLS = [
   {
@@ -29,10 +27,10 @@ MCP_TOOLS = [
       "parameters":{
           "type":"object",
           "properties":{
-            "app": {"type": "string", "description": "Nome do app (ex: spotify)"},
-            "api": {"type": "string", "description": "Nome da api (ex: login)"}
+            "app": {"type": "string", "description": "Nome do app"},
+            "api": {"type": "string", "description": "Nome da api"}
           },
-              "required":["app", "api"]
+          "required":["app", "api"]
       }
     }
   },
@@ -46,7 +44,7 @@ MCP_TOOLS = [
               "properties":{
                   "app": {"type": "string"},
                   "api": {"type": "string"},
-                  "arguments": {"type": "object", "description": "Dicionário com os argumentos da API (ex: {'username': '...', 'password': '...'})"}
+                  "arguments": {"type": "object", "description": "Dicionário com os argumentos da API"}
               },
               "required":["app", "api", "arguments"]
           }
@@ -59,7 +57,7 @@ MCP_TOOLS = [
           "description":"Executa Python com o objeto 'apis' no escopo",
           "parameters":{
               "type":"object",
-              "properties": {"code": {"type": "string", "description": "Código Python a ser executado"}},
+              "properties": {"code": {"type": "string", "description": "Código Python"}},
               "required": ["code"]
           }
       }
@@ -68,49 +66,128 @@ MCP_TOOLS = [
       "type":"function",
       "function":{
           "name":"complete_task",
-          "description":"OBRIGATÓRIO para encerrar a tarefa. Envia a resposta final ao Oráculo",
+          "description":"OBRIGATÓRIO para encerrar a tarefa.",
           "parameters":{
               "type":"object",
-              "properties": {"answer": {"type": "string", "description": "A resposta final exata (deixe em branco se for tarefa apenas de ação)"}}
+              "properties": {"answer": {"type": "string", "description": "Resposta final"}}
           }
       }
   }
 ]
 
+def _limpar_memoria(memoria, max_entries=100):
+    """
+    Higiene de memória: deduplica, consolida e trunca.
+    Lida com formatos mistos (strings legacy e dicts novos).
+    """
+    if not isinstance(memoria, dict) or not memoria:
+        return memoria
+
+    limpa = {}
+    tokens_auth = {}
+    skills = {}
+    workflows = {}
+    outros = []
+
+    for chave, valor in memoria.items():
+        # Normalização: converte string legacy para dict padronizado
+        if isinstance(valor, str):
+            valor = {"token": valor, "timestamp": 0}
+        
+        if not isinstance(valor, dict):
+            continue
+            
+        ts = valor.get("timestamp", 0)
+        
+        # 1. Tokens de Auth
+        if chave.startswith("auth_"):
+            app = chave.replace("auth_", "")
+            # Mantém o mais recente. Se timestamps iguais (0), mantém o que processou por último (ok)
+            if app not in tokens_auth or ts > tokens_auth[app][2]:
+                tokens_auth[app] = (chave, valor, ts)
+        
+        # 2. Skills (Consolidação Corrigida)
+        elif chave.startswith("skill_"):
+            partes = chave.split("_", 2)
+            if len(partes) >= 3:
+                skill_id = f"{partes[1]}_{partes[2]}"
+                
+                # Estratégia: Sempre manter a base da mais recente, mas fundir dados da mais antiga
+                if skill_id in skills:
+                    existente = skills[skill_id]
+                    ts_existente = existente.get("timestamp", 0)
+                    
+                    # Define qual é a base (mais recente) e qual é a complementar (mais antiga)
+                    if ts >= ts_existente:
+                        base, complementar = valor, existente
+                    else:
+                        base, complementar = existente, valor
+                    
+                    # Funde argumentos e capacidades na base
+                    args_base = set(base.get("arguments_pattern", []))
+                    args_comp = set(complementar.get("arguments_pattern", []))
+                    base["arguments_pattern"] = list(args_base | args_comp)
+                    
+                    caps_base = base.get("capabilities", {})
+                    caps_comp = complementar.get("capabilities", {})
+                    base["capabilities"] = {**caps_base, **caps_comp}
+                    
+                    # Garante que o timestamp seja o maior
+                    base["timestamp"] = max(ts, ts_existente)
+                    
+                    skills[skill_id] = base
+                else:
+                    skills[skill_id] = valor
+
+        # 3. Workflows e Outros
+        elif chave.startswith("workflow_"):
+            workflows[chave] = valor
+        else:
+            outros.append((chave, valor, ts))
+
+    # Reconstrução
+    for app, (chave, valor, ts) in tokens_auth.items():
+        limpa[chave] = valor
+
+    for skill_id, valor in skills.items():
+        limpa[f"skill_{skill_id}"] = valor
+
+    for chave, valor in workflows.items():
+        limpa[chave] = valor
+
+    outros.sort(key=lambda x: x[2], reverse=True)
+    for chave, valor, ts in outros:
+        limpa[chave] = valor
+
+    # Truncamento
+    if len(limpa) > max_entries:
+        todos = [(k, v) for k, v in limpa.items()]
+        todos.sort(key=lambda x: x[1].get("timestamp", 0), reverse=True)
+        limpa = dict(todos[:max_entries])
+        print(f"[HYGIENE] Memória truncada para {max_entries} entries")
+
+    return limpa
+
 def call_with_retry(func, *args, max_retries=4, base_delay=2, **kwargs):
   for attempt in range(max_retries):
     try:
-      # 1 executa a funcao
       resultado = func(*args, **kwargs)
-            
-      # 2 verifica se a funcao retornou um dicionario com erro (comportamento do ctx.model)
       if isinstance(resultado, dict) and "error" in resultado:
         erro_msg = str(resultado["error"])
-        if "429" in erro_msg or "budget exhausted" in erro_msg.lower() or "too many requests" in erro_msg.lower():
-          # força a ida para o catch levantando a excecao
+        if "429" in erro_msg or "budget exhausted" in erro_msg.lower():
           raise Exception(erro_msg)
-        else:
-          # se for um erro de prompt (ex: content vazio), nao eh falha de rede, entao devolve o erro
-          return resultado
-            
-      # se deu tudo certo, retorna o resultado
+        return resultado
       return resultado
-
     except Exception as e:
-      # 3 detecta 429 ou outros erros transitorios (captura do ctx.mcp.call ou do raise acima)
-      if "429" in str(e) or "budget exhausted" in str(e).lower() or "too many requests" in str(e).lower():
-        if attempt < max_retries - 1: # nao dorme na ultima tentativa falha
+      if "429" in str(e) or "budget exhausted" in str(e).lower():
+        if attempt < max_retries - 1:
           delay = base_delay * (2 ** attempt) + random.uniform(0, 1.0)
-          print(f"[RETRY] Tentativa {attempt+1}/{max_retries} falhou com 429. Aguardando {delay:.2f}s...")
+          print(f"[RETRY] 429 detected. Waiting {delay:.2f}s...")
           time.sleep(delay)
           continue
-            
-      # se nao for 429 ou se acabaram as tentativas, explode o erro para o log
       if attempt == max_retries - 1:
-        return {"error": f"Falha após {max_retries} tentativas. Erro original: {str(e)}"}
-
-      # para erros nao-transitorios, retorna imediatamente
-      return {"error": str(e)}  # remove o continue implicito
+        return {"error": f"Falha após {max_retries} tentativas: {str(e)}"}
+      return {"error": str(e)}
 
 def solve(ctx):
   api_schema_cache = {}
@@ -118,30 +195,25 @@ def solve(ctx):
   override = os.getenv("APPWORLD_TASK_OVERRIDE")
   if override:
     ctx.instruction = override
-    print(f"[OVERRIDE] Tarefa forçada: {override}")
+    print(f"[OVERRIDE] {override}")
+  
   instruction = ctx.instruction
   print(f"\n[NOVA TAREFA] {instruction}\n")
 
-  # memoria: carrega o que foi aprendido em tarefas passadas
   memoria_sessao = ctx.memory.read()
   if not isinstance(memoria_sessao, dict):
     memoria_sessao = {}
-    
+
   instruction_lower = instruction.lower()
-  # Usa o mapeamento expandido do retriever (muito mais completo que hardcoded terms)
   apps_necessarios = set()
   for app, keywords in APP_KEYWORD_MAP.items():
       if any(kw in instruction_lower for kw in keywords):
           apps_necessarios.add(app)
 
-   # RAG: busca as ferramentas usando o indice local com query expansion e app boosting
-  context_docs = rag_retriever.search(instruction, boost_relevant_apps=list(apps_necessarios))
-  
+  # RAG com fallback inteligente (não chama LLM se keywords funcionarem)
+  context_docs = rag_retriever.search(instruction, boost_relevant_apps=list(apps_necessarios), ctx=ctx)
 
-  #print(f"\n[DIAGNOSTICO ANTES DO FILTRO] memoria total no disco: {memoria_sessao.keys()}\n")
-
-
-          
+  # Filtra memória
   memoria_filtrada = {}
   for chave, valor in memoria_sessao.items():
     if chave.startswith("auth_"):
@@ -149,227 +221,195 @@ def solve(ctx):
       if app_name in apps_necessarios:
         memoria_filtrada[chave] = valor
     else:
-      # Filter learned skills by app relevance too
-      # Assume skill keys follow pattern: "skill_<app>_<description>"
-      # Or check if the skill content mentions irrelevant apps
       should_keep = any(app in chave.lower() for app in apps_necessarios)
       if should_keep or not any(app in str(valor).lower() for app in APP_KEYWORD_MAP.keys()):
           memoria_filtrada[chave] = valor
 
-  #print(f"[DIAGNOSTICO DEPOIS DO FILTRO] apps deduzidos: {apps_necessarios}")
-  #print(f"[DIAGNOSTICO DEPOIS DO FILTRO] memoria injetada: {memoria_filtrada.keys()}\n")
+  system_prompt = f"""You are an expert AppWorld engineer.
+Principles: Minimalism, Verification, Efficiency, Precision.
+Workflow: Analyze -> Check Memory -> Auth (if needed) -> Discover (api_doc) -> Inspect Keys -> Execute -> Finalize.
+Constraints: App Isolation (ONLY use mentioned apps), No Hallucination, Step Limit ({ctx.max_steps}).
+Error Recovery: On KeyError, inspect keys first.
 
-  system_prompt = f"""You are an expert software engineer in AppWorld. Solve tasks efficiently and precisely.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🎯 CORE PRINCIPLES
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1. **Minimalism**: Use only apps explicitly mentioned or required by the task
-2. **Verification**: Always inspect API schemas before calling
-3. **Efficiency**: Prefer single run_code scripts over multiple call_api calls
-4. **Precision**: Never invent parameters, field names, or credentials
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📋 EXECUTION WORKFLOW
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-STEP 1 — ANALYZE & RESTRICT
-- Identify ONLY the apps needed for this specific task
-- IGNORE all other apps, even if tokens exist in memory
-- Example: "Venmo payment" → ONLY Venmo APIs allowed
-
-STEP 2 — CHECK MEMORY
-- Review session memory for existing auth tokens and learned patterns
-- If token exists but email mismatch (verify via supervisor.show_profile()), re-login
-
-STEP 3 — AUTHENTICATE (if needed)
-- If no valid token in memory:
-  • Call supervisor.show_profile() and supervisor.show_account_passwords()
-  • Login via call_api with real credentials
-  • Save full response dict as auth_{{app}}
-
-STEP 4 — DISCOVER APIS
-- Use search_apis to find relevant endpoints
-- ALWAYS call api_doc BEFORE using any API to see exact parameters
-- For list APIs: plan pagination (page_index=0,1,... until empty)
-
-STEP 5 — INSPECT SCHEMAS
-- First time seeing API output? Run: print(list(result[0].keys()))
-- Look for "*_ids" or "*_items" keys for nested data access
-- Use .get('field', None) for safe field access
-- For missing attributes, call detail APIs (show_*, get_details)
-
-STEP 6 — EXECUTE
-- Single operations (login, create, delete): use call_api
-- Complex ops (pagination, filtering, aggregation): use run_code
-- In run_code: use ONLY apis.<app>.<api>(...) syntax, NEVER apis.call_api()
-- Use datetime.now() for dynamic dates ("last 7 days", "this week")
-
-STEP 7 — FINALIZE IMMEDIATELY
-- Once you have the exact answer, call complete_task
-- NO extra exploration unless explicitly requested
-- Action-only tasks (send, pay, create, delete): complete_task with answer=""
-- Question tasks (what, list, how many): complete_task with exact answer
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-⚠️ CRITICAL CONSTRAINTS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- **App Isolation**: Task mentions Spotify? ONLY use Spotify APIs. Period.
-- **No Hallucination**: Never guess field names or parameters
-- **Step Limit**: You have {ctx.max_steps} steps — be efficient
-- **Error Recovery**: On KeyError, inspect keys with .keys(), fix, retry ONCE
-- **Post-Answer Silence**: After printing final answer in run_code, stop. Next step: complete_task.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🧠 SKILL MEMORY
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-When you solve something successfully, save the pattern:
-Example: "Amazon cheap books → search_products(sort_by='+price', filter product_type contains 'book')"
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📚 AVAILABLE KNOWLEDGE (RAG)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+AVAILABLE KNOWLEDGE (RAG):
 {context_docs}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-💾 SESSION MEMORY
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SESSION MEMORY (Filtered):
 {json.dumps(memoria_filtrada)}
 """
 
   messages = [
     {"role": "system", "content": system_prompt},
-    {"role": "user", "content": "Analyze the task. If required tokens are already in Session Memory, use them directly. Solve efficiently and stop as soon as you have the answer."}
+    {"role": "user", "content": "Solve efficiently. Use memory tokens if available."}
   ]
   encerrou = False
   
-  # harness agentica: loop principal
   for passo in range(ctx.max_steps):
     print(f"\n--- Passo {passo+1}/{ctx.max_steps} ---")
-
-      
-    # chama o modelo usando o metodo do SDK passando o schema das ferramentas
     resposta = call_with_retry(ctx.model, messages, tools=MCP_TOOLS)
 
     if isinstance(resposta, dict) and resposta.get("error"):
-      print(f"erro de conexao: {resposta['error']}")
-      break
-    elif isinstance(resposta, list):
-      print(f"erro da API: {resposta}")
+      print(f"Erro conexão: {resposta['error']}")
       break
     elif not isinstance(resposta, dict):
-      print(f"Resposta inesperada do modelo: {type(resposta)} - {resposta}")
       break
 
-    # extrai a mensagem do modelo (agora resposta é garantidamente um dict)
     msg = resposta.get("choices", [{}])[0].get("message", {})
-
-    # garantindo que a mensagem que volta para o historico eh um dict valido
-    if hasattr(msg, "model_dump"):
-      msg_dict = msg.model_dump(exclude_none=True)
-    else:
-      msg_dict = msg if isinstance(msg, dict) else dict(msg)
+    if hasattr(msg, "model_dump"): msg_dict = msg.model_dump(exclude_none=True)
+    else: msg_dict = msg if isinstance(msg, dict) else dict(msg)
     
-    # se content for vazio ou None, injeta um texto padrão
-    if not msg_dict.get("content"):
-      msg_dict["content"] = "executing tool"
-    
+    if not msg_dict.get("content"): msg_dict["content"] = "executing"
     messages.append(msg_dict)
-
-    #if msg_dict.get("content"):
-      #print(f"[pensamento]: {msg_dict.get('content')}")
 
     tool_calls = msg_dict.get("tool_calls")
     if not tool_calls:
-      #print("[aviso]: modelo nao chamou ferramenta, forçando continuacao...")
-      messages.append({"role":"user", "content":"você nao executou nenhuma acao. Use uma ferramenta ou chame complete_task"})
+      messages.append({"role":"user", "content":"Execute a tool or complete_task."})
       continue
     
-    # execucao das ferramentas
     for tc in tool_calls:
       t_id = tc["id"]
       t_name = tc["function"]["name"]
+      try: t_args = json.loads(tc["function"]["arguments"])
+      except: t_args = {}
 
-      # tenta decodificar os argumentos JSON gerados pelo modelo
-      try:
-        t_args = json.loads(tc["function"]["arguments"])
-      except json.JSONDecodeError:
-        t_args = {}
-
-      print(f"executando: {t_name} com {t_args}")
+      print(f"-> {t_name}")
 
       if t_name == "complete_task":
-          instruction_lower = ctx.instruction.lower()
+          # Detecção de ação pura (verbs em inglês apenas)
           question_words = ["how many", "list", "what", "which", "give me", "tell me", "show me"]
-          action_verbs = ["send", "pay", "move", "go", "keep going", "reach", "create", "delete", "follow", "like", "comment", "post", "add", "remove", "curtir", "comentar"]
+          action_verbs = ["send", "pay", "move", "go", "reach", "create", "delete", "follow", "like", "comment", "post", "add", "remove"]
           
-          is_action = False
-          # se nao tem palavra de pergunta explícita E tem verbo de acao forte
-          if not any(qw in instruction_lower for qw in question_words):
-            if any(av in instruction_lower for av in action_verbs):
-              is_action = True
+          is_action = not any(qw in instruction_lower for qw in question_words) and \
+                      any(av in instruction_lower for av in action_verbs)
                   
           if is_action:
-            print("[INTERCEPTAÇÃO] tarefa identificada como AÇÃO pura. Forçando answer=''")
-            if isinstance(t_args, dict):
-              t_args["answer"] = ""
-            else:
-              t_args = {"answer": ""}
+            t_args["answer"] = ""
           
           resultado = call_with_retry(ctx.mcp.call, t_name, t_args)
           encerrou = True
-        
       else:
           if t_name == "call_api":
-            app = t_args.get("app")
-            api = t_args.get("api")
+            app, api = t_args.get("app"), t_args.get("api")
             cache_key = f"{app}:{api}"
             if cache_key not in api_schema_cache:
-              print(f"[INTROSPECÇÃO] Obtendo documentação de {app}.{api}...")
               doc_result = call_with_retry(ctx.mcp.call, "api_doc", {"app": app, "api": api})
               api_schema_cache[cache_key] = doc_result
-              # Injeta o schema no histórico como mensagem de sistema
-              messages.append({
-                  "role": "system",
-                  "content": f"Parâmetros da API {app}.{api}:\n{json.dumps(doc_result, indent=2)[:1500]}"
-                })
-            resultado = call_with_retry(ctx.mcp.call, t_name, t_args)
-          elif t_name in ["run_code", "search_apis", "api_doc"]:
+              messages.append({"role": "system", "content": f"Schema {app}.{api}: {json.dumps(doc_result)[:1000]}"})
             resultado = call_with_retry(ctx.mcp.call, t_name, t_args)
           else:
-            resultado = ctx.mcp.call(t_name, t_args)
+            resultado = call_with_retry(ctx.mcp.call, t_name, t_args)
 
-                
-      
-      # adiciona o resultado da ferramenta ao historico de mensagens
       conteudo_json = json.dumps(resultado, default=str)
-      # se a serialização ficar vazia, devolve uma confirmação ---
-      if not conteudo_json or conteudo_json == '""' or conteudo_json.isspace():
-        conteudo_json = '"ok"'
-          
-      messages.append({
-        "role":"tool",
-        "tool_call_id": t_id,
-        "content":conteudo_json
-      })
+      if not conteudo_json or conteudo_json == '""': conteudo_json = '"ok"'
+      messages.append({"role":"tool", "tool_call_id": t_id, "content":conteudo_json})
 
-      # erros com a API: se a API reclamar (ex: token faltando), avisa o modelo
+      # RECUPERAÇÃO DE ERROS (Sem ctx.reflect)
       if isinstance(resultado, dict) and "error" in resultado:
-        erro_msg = resultado["error"]
-        print(f"erro na ferramenta: {erro_msg}")
-        ctx.reflect(f"erro em {t_name}:{erro_msg}")
-        messages.append({
-          "role": "user", 
-          "content": f"A chamada falhou com o erro: '{erro_msg}'. Analise o problema (ex: falta de access_token, parâmetro errado), corrija e tente novamente."
-        })
+        erro_msg = str(resultado["error"])
+        recovery_prompt = ""
+        
+        if "401" in erro_msg or "unauthorized" in erro_msg.lower():
+          recovery_prompt = f"⚠️ 401 Error in {t_args.get('app')}. ACTION: Re-login via supervisor.show_profile() + show_account_passwords(), then retry."
+        elif "keyerror" in erro_msg.lower() or "attribute" in erro_msg.lower():
+          recovery_prompt = "⚠️ Data Error. ACTION: Stop. Use run_code to print(result.keys()). Inspect and fix field name."
+        elif "429" in erro_msg:
+          recovery_prompt = "⚠️ Rate Limit. ACTION: Wait or batch operations in run_code."
+        elif "404" in erro_msg:
+          recovery_prompt = "⚠️ 404 Not Found. ACTION: Verify IDs or check pagination."
+        else:
+          recovery_prompt = f"⚠️ Error: {erro_msg}. Analyze and fix."
 
-      # se o agente chama a complete_task, sai do loop
+        messages.append({"role": "user", "content": recovery_prompt})
+        print(f"[RECOVERY] Injected prompt for error.")
+
     if encerrou:
-      print("tarefa finalizada")
+      print("Tarefa finalizada. Salvando memória...")
+      memoria_atual = ctx.memory.read()
+      if not isinstance(memoria_atual, dict): memoria_atual = {}
+
+      # Salva tokens com formato PADRONIZADO
+      for chave, valor in memoria_filtrada.items():
+        if chave.startswith("auth_"):
+          # Garante formato dict com timestamp
+          token_val = valor if isinstance(valor, str) else valor.get("token", str(valor))
+          memoria_atual[chave] = {
+            "token": token_val,
+            "timestamp": time.time(),
+            "source": "current_task"
+          }
+
+      # Skill Extraction
+      for i, msg in enumerate(messages):
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+          for tc in msg["tool_calls"]:
+            if tc["function"]["name"] == "call_api":
+              t_args = json.loads(tc["function"]["arguments"])
+              app, api = t_args.get("app"), t_args.get("api")
+              arguments = t_args.get("arguments", {})
+              
+              # Verifica sucesso
+              for j in range(i+1, min(i+3, len(messages))):
+                if messages[j].get("role") == "tool":
+                  try:
+                    result = json.loads(messages[j].get("content", "{}"))
+                    if isinstance(result, dict) and "error" not in result:
+                      skill_key = f"skill_{app}_{api}"
+                      # Cria ou atualiza skill (a limpeza fará a fusão depois)
+                      if skill_key not in memoria_atual:
+                        skill_data = {
+                          "timestamp": time.time(),
+                          "arguments_pattern": list(arguments.keys()),
+                          "result_keys": list(result.keys())[:10] if isinstance(result, dict) else [],
+                          "capabilities": {}
+                        }
+                        if "page_index" in arguments: skill_data["capabilities"]["supports_pagination"] = True
+                        if "sort_by" in arguments: skill_data["capabilities"]["supports_sorting"] = True
+                        memoria_atual[skill_key] = skill_data
+                  except: pass
+                  break
+
+      # Workflow Saving (Chave mais única)
+      if instruction_lower:
+        workflow_details = []
+        apps_used = set()
+        for msg in messages:
+          if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            for tc in msg["tool_calls"]:
+              t_args = json.loads(tc["function"]["arguments"])
+              if tc["function"]["name"] == "call_api" and t_args.get("app"):
+                apps_used.add(t_args["app"])
+                workflow_details.append(f"{t_args['app']}.{t_args.get('api')}")
+        
+        if apps_used:
+          # Hash dos apps + primeiras palavras para unicidade
+          apps_hash = hashlib.md5(str(sorted(apps_used)).encode()).hexdigest()[:6]
+          instr_preview = "_".join(instruction_lower.split()[:4])
+          workflow_key = f"workflow_{apps_hash}_{instr_preview}"
+          
+          if workflow_key not in memoria_atual:
+            memoria_atual[workflow_key] = {
+              "apps_used": list(apps_used),
+              "api_sequence": workflow_details[:10],
+              "completed": True,
+              "timestamp": time.time()
+            }
+
+      # Limpeza e Escrita
+      memoria_limpa = _limpar_memoria(memoria_atual, max_entries=100)
+      ctx.memory.write(memoria_limpa)
+      print(f"[MEMÓRIA] {len(memoria_limpa)} entries salvas.")
       break
 
-  # se estourar o limite de 50 passos sem encerrar, força o encerramento
   if not encerrou:
-    print("limite de passos atingido, printando resposta vazia")
-    ctx.mcp.call("complete_task", {"answer":""})      
-
+    print("Timeout. Forçando complete_task.")
+    ctx.mcp.call("complete_task", {"answer":""})
+    # Fallback também salva memória padronizada
+    memoria_atual = ctx.memory.read()
+    if not isinstance(memoria_atual, dict): memoria_atual = {}
+    for chave, valor in memoria_filtrada.items():
+      if chave.startswith("auth_"):
+        token_val = valor if isinstance(valor, str) else valor.get("token", str(valor))
+        memoria_atual[chave] = {"token": token_val, "timestamp": time.time()}
+    
+    memoria_limpa = _limpar_memoria(memoria_atual, max_entries=100)
+    ctx.memory.write(memoria_limpa)
