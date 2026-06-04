@@ -1,7 +1,7 @@
 import time
 import random
 import json
-from retriever import API_Retriever
+from retriever import API_Retriever, APP_KEYWORD_MAP
 
 rag_retriever = API_Retriever()
 
@@ -108,10 +108,12 @@ def call_with_retry(func, *args, max_retries=4, base_delay=2, **kwargs):
       # se nao for 429 ou se acabaram as tentativas, explode o erro para o log
       if attempt == max_retries - 1:
         return {"error": f"Falha após {max_retries} tentativas. Erro original: {str(e)}"}
-            
-      return {"error": str(e)}
+
+      # para erros nao-transitorios, retorna imediatamente
+      return {"error": str(e)}  # remove o continue implicito
 
 def solve(ctx):
+  api_schema_cache = {}
   import os
   override = os.getenv("APPWORLD_TASK_OVERRIDE")
   if override:
@@ -120,9 +122,9 @@ def solve(ctx):
   instruction = ctx.instruction
   print(f"\n[NOVA TAREFA] {instruction}\n")
 
-  # RAG: busca as ferramentas usando o indice local
-  context_docs = rag_retriever.search(instruction)
-
+   # RAG: busca as ferramentas usando o indice local com query expansion e app boosting
+  context_docs = rag_retriever.search(instruction, boost_relevant_apps=list(apps_necessarios))
+  
   # memoria: carrega o que foi aprendido em tarefas passadas
   memoria_sessao = ctx.memory.read()
   if not isinstance(memoria_sessao, dict):
@@ -132,102 +134,112 @@ def solve(ctx):
 
   instruction_lower = instruction.lower()
   
-  # dict de mapeamento de intencao para o respectivo app
-  keywords_to_apps = {
-      "spotify": ["spotify", "song", "album", "playlist", "music", "track"],
-      "venmo": ["venmo", "pay", "paid", "owed money", "send money", "transaction"],
-      "phone": ["phone", "text", "message", "contact", "sms"],
-      "gmail": ["gmail", "email", "inbox", "thread"],
-      "todoist": ["todoist", "task", "project", "todo"],
-      "file_system": ["file", "directory", "folder", "system"],
-      "simple_note": ["note", "simple_note"],
-      "splitwise": ["splitwise", "expense", "owe", "balance", "group"],
-      "amazon": ["amazon", "order", "buy", "product", "cart"]
-  }
-  
+  # Usa o mapeamento expandido do retriever (muito mais completo que hardcoded terms)
   apps_necessarios = set()
-  for app, keywords in keywords_to_apps.items():
+  for app, keywords in APP_KEYWORD_MAP.items():
       if any(kw in instruction_lower for kw in keywords):
           apps_necessarios.add(app)
+
           
   memoria_filtrada = {}
   for chave, valor in memoria_sessao.items():
-      # se for token de autenticação, passa se o app for necessário
-      if chave.startswith("auth_"):
-          app_name = chave.replace("auth_", "")
-          if app_name in apps_necessarios:
-              memoria_filtrada[chave] = valor
-      else:
-          # mantem na memoria aprendizados gerais ou regras que nao sao tokens
+    if chave.startswith("auth_"):
+      app_name = chave.replace("auth_", "")
+      if app_name in apps_necessarios:
+        memoria_filtrada[chave] = valor
+    else:
+      # Filter learned skills by app relevance too
+      # Assume skill keys follow pattern: "skill_<app>_<description>"
+      # Or check if the skill content mentions irrelevant apps
+      should_keep = any(app in chave.lower() for app in apps_necessarios)
+      if should_keep or not any(app in str(valor).lower() for app in keywords_to_apps.keys()):
           memoria_filtrada[chave] = valor
 
   #print(f"[DIAGNOSTICO DEPOIS DO FILTRO] apps deduzidos: {apps_necessarios}")
   #print(f"[DIAGNOSTICO DEPOIS DO FILTRO] memoria injetada: {memoria_filtrada.keys()}\n")
 
-  system_prompt = f"""Você é um engenheiro de software no AppWorld. Resolva a tarefa com eficiência.
+  system_prompt = f"""You are an expert software engineer in AppWorld. Solve tasks efficiently and precisely.
 
-=== PROTOCOLO OBRIGATÓRIO ===
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 CORE PRINCIPLES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. **Minimalism**: Use only apps explicitly mentioned or required by the task
+2. **Verification**: Always inspect API schemas before calling
+3. **Efficiency**: Prefer single run_code scripts over multiple call_api calls
+4. **Precision**: Never invent parameters, field names, or credentials
 
-1. ENTENDA a tarefa e identifique quais aplicativos são necessários.
-2. Consulte a MEMÓRIA DA SESSÃO (tokens e habilidades salvas) antes de qualquer ação.
-3. Para qualquer app que precise de autenticação:
-   - Se não houver token na memória, chame supervisor.show_profile() e supervisor.show_account_passwords() para obter credenciais reais.
-   - Faça login usando call_api. NUNCA invente credenciais.
-   - Salve o dicionário completo de resposta (access_token, refresh_token, etc.) como auth_{{app}}.
-4. DESCOBERTA DE APIS:
-   - Use search_apis para encontrar endpoints relevantes.
-   - Leia api_doc antes de usar uma API desconhecida.
-5. INTROSPECÇÃO DE ESQUEMAS:
-   - No primeiro resultado de qualquer listagem, execute um pequeno run_code para imprimir as chaves do primeiro item: print(list(resultado[0].keys())).
-   - Use .get('chave', fallback) para acessar campos.
-   - Se um item de resumo contiver uma chave que termina em "_ids" ou "_items", use-a diretamente para obter IDs aninhados (ex: album['song_ids']).
-6. EXECUÇÃO:
-   - Para operações pontuais (login, criar um item, deletar), use call_api.
-   - Para paginação, filtros, agregações ou operações em massa, escreva um único script em run_code.
-   - Todas as APIs de listagem devem ser paginadas: page_index = 0,1,... até resposta vazia.
-7. FINALIZAÇÃO:
-   - Assim que obtiver a resposta exata solicitada (ex: o produto mais barato, a lista de músicas), chame complete_task com a resposta.
-   - NÃO faça passos adicionais (explorar outros termos, adicionar ao carrinho, etc.) a menos que a tarefa peça explicitamente.
-8. RECUPERAÇÃO DE ERROS:
-   - Se run_code falhar com KeyError, trace o erro, inspecione as chaves do objeto (print(objeto.keys())) e corrija o nome do campo.
-   - Retry no máximo uma vez. Se falhar novamente, ajuste o plano e chame complete_task com uma explicação.
-9. MEMÓRIA DE HABILIDADES:
-   - Quando você resolver uma tarefa com sucesso, registre o procedimento (ex: "para buscar livros baratos na Amazon, use search_products com sort_by='+price' e filtre product_type contendo 'book'").
-   - Ao iniciar uma tarefa semelhante, recupere essa habilidade da memória.
-   
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📋 EXECUTION WORKFLOW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-=== LIMITES ===
-- Você tem no máximo {ctx.max_steps} passos.
-- **PROIBIÇÃO ABSOLUTA:** Se a tarefa mencionar apenas "Venmo" (ou "Venmo payments"), NÃO execute ações em Splitwise, Todoist, Gmail, Simple Note, Spotify ou qualquer outro app. Ignore completamente os tokens desses apps que estejam na memória.
-- Prefira run_code a múltiplas call_api para economizar passos.
-- Nunca invente parâmetros ou nomes de campos.
-- **Tarefas de ação pura:** Se a instrução não pedir explicitamente uma resposta textual (ex: "send", "go to", "keep going", "pay", "text"), chame `complete_task` com `""` (string vazia). Não invente respostas descritivas.
-- **PROIBIDO: NÃO use Gmail, Todoist, Simple Note, File System ou qualquer outro app não mencionado na tarefa.** Mesmo que a memória contenha tokens para eles, ignore-os completamente. Se a tarefa fala apenas de Spotify, apenas APIs do Spotify são permitidas.
-- **Verificação de identidade:** No início da tarefa, chame supervisor.show_profile(). Se o email retornado for diferente do email associado ao token salvo (ex: token_spotify foi gerado para outro usuário), ignore o token e faça um novo login.
-- **Dentro de run_code, use APENAS a sintaxe `apis.<app>.<api>(...)`. NUNCA use `apis.call_api()` (ela não funciona).**
-- APÓS IMPRIMIR A RESPOSTA FINAL no run_code, NÃO execute mais nenhum comando. No passo seguinte, chame complete_task com a resposta. Se você já tem a resposta e ainda há passos restantes, ignore-os e finalize.
-- **Datas dinâmicas:** Se a tarefa mencionar "last N days", "this week", "today", etc., use `datetime.datetime.now()` e `datetime.timedelta` no código. NUNCA use datas fixas.
+STEP 1 — ANALYZE & RESTRICT
+- Identify ONLY the apps needed for this specific task
+- IGNORE all other apps, even if tokens exist in memory
+- Example: "Venmo payment" → ONLY Venmo APIs allowed
 
-=== DESCOBRINDO A ESTRUTURA DE APIS DESCONHECIDAS ===
-- Use search_apis para encontrar endpoints de listagem (ex: `<app> show`, `<app> list`, `<app> library`).
-- Leia api_doc para conhecer os parâmetros e a resposta.
-- No primeiro resultado de uma listagem, imprima as chaves: print(list(resultado[0].keys())).
-- Se houver uma chave que termina em "_ids" (ex: song_ids, transaction_ids, item_ids), use-a diretamente para obter IDs aninhados.
-- Para atributos que não estão no resumo (ex: gênero, play_count), chame a API de detalhes (ex: show_song, show_transaction, get_details).
-- Paginação universal: page_index = 0,1,... até lista vazia.
+STEP 2 — CHECK MEMORY
+- Review session memory for existing auth tokens and learned patterns
+- If token exists but email mismatch (verify via supervisor.show_profile()), re-login
 
-=== CONHECIMENTO INICIAL (RAG) ===
+STEP 3 — AUTHENTICATE (if needed)
+- If no valid token in memory:
+  • Call supervisor.show_profile() and supervisor.show_account_passwords()
+  • Login via call_api with real credentials
+  • Save full response dict as auth_{{app}}
+
+STEP 4 — DISCOVER APIS
+- Use search_apis to find relevant endpoints
+- ALWAYS call api_doc BEFORE using any API to see exact parameters
+- For list APIs: plan pagination (page_index=0,1,... until empty)
+
+STEP 5 — INSPECT SCHEMAS
+- First time seeing API output? Run: print(list(result[0].keys()))
+- Look for "*_ids" or "*_items" keys for nested data access
+- Use .get('field', None) for safe field access
+- For missing attributes, call detail APIs (show_*, get_details)
+
+STEP 6 — EXECUTE
+- Single operations (login, create, delete): use call_api
+- Complex ops (pagination, filtering, aggregation): use run_code
+- In run_code: use ONLY apis.<app>.<api>(...) syntax, NEVER apis.call_api()
+- Use datetime.now() for dynamic dates ("last 7 days", "this week")
+
+STEP 7 — FINALIZE IMMEDIATELY
+- Once you have the exact answer, call complete_task
+- NO extra exploration unless explicitly requested
+- Action-only tasks (send, pay, create, delete): complete_task with answer=""
+- Question tasks (what, list, how many): complete_task with exact answer
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️ CRITICAL CONSTRAINTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- **App Isolation**: Task mentions Spotify? ONLY use Spotify APIs. Period.
+- **No Hallucination**: Never guess field names or parameters
+- **Step Limit**: You have {ctx.max_steps} steps — be efficient
+- **Error Recovery**: On KeyError, inspect keys with .keys(), fix, retry ONCE
+- **Post-Answer Silence**: After printing final answer in run_code, stop. Next step: complete_task.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🧠 SKILL MEMORY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+When you solve something successfully, save the pattern:
+Example: "Amazon cheap books → search_products(sort_by='+price', filter product_type contains 'book')"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📚 AVAILABLE KNOWLEDGE (RAG)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 {context_docs}
 
-=== MEMÓRIA DA SESSÃO ===
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💾 SESSION MEMORY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 {json.dumps(memoria_filtrada)}
 """
-  
+
   messages = [
     {"role": "system", "content": system_prompt},
-    {"role": "user", "content": "Analise a tarefa. Se os tokens necessários já estiverem na Memória da Sessão, use-os direto. Resolva de forma direta e rápida."}
+    {"role": "user", "content": "Analyze the task. If required tokens are already in Session Memory, use them directly. Solve efficiently and stop as soon as you have the answer."}
   ]
-
   encerrou = False
   
   # harness agentica: loop principal
@@ -283,8 +295,7 @@ def solve(ctx):
 
       print(f"executando: {t_name} com {t_args}")
 
-      try:
-        if t_name == "complete_task":
+      if t_name == "complete_task":
           instruction_lower = ctx.instruction.lower()
           question_words = ["how many", "list", "what", "which", "give me", "tell me", "show me"]
           action_verbs = ["send", "pay", "move", "go", "keep going", "reach", "create", "delete", "follow", "like", "comment", "post", "add", "remove", "curtir", "comentar"]
@@ -305,13 +316,28 @@ def solve(ctx):
           resultado = call_with_retry(ctx.mcp.call, t_name, t_args)
           encerrou = True
         
-        else:
-          # para todas as outras ferramentas (search_apis, api_doc, call_api, run_code)
-          resultado = ctx.mcp.call(t_name, t_args)
-                
-      except Exception as e:
-        resultado = {"error":f"exceção interna: {str(e)}"}
+      else:
+          if t_name == "call_api":
+            app = t_args.get("app")
+            api = t_args.get("api")
+            cache_key = f"{app}:{api}"
+            if cache_key not in api_schema_cache:
+              print(f"[INTROSPECÇÃO] Obtendo documentação de {app}.{api}...")
+              doc_result = call_with_retry(ctx.mcp.call, "api_doc", {"app": app, "api": api})
+              api_schema_cache[cache_key] = doc_result
+              # Injeta o schema no histórico como mensagem de sistema
+              messages.append({
+                  "role": "system",
+                  "content": f"Parâmetros da API {app}.{api}:\n{json.dumps(doc_result, indent=2)[:1500]}"
+                })
+            resultado = call_with_retry(ctx.mcp.call, t_name, t_args)
+          elif t_name in ["run_code", "search_apis", "api_doc"]:
+            resultado = call_with_retry(ctx.mcp.call, t_name, t_args)
+          else:
+            resultado = ctx.mcp.call(t_name, t_args)
 
+                
+      
       # adiciona o resultado da ferramenta ao historico de mensagens
       conteudo_json = json.dumps(resultado, default=str)
       # se a serialização ficar vazia, devolve uma confirmação ---
